@@ -789,7 +789,7 @@ def parse_date_with_year_inference(date_str, current_year, month_map):
     # Pattern 1: Numeric date with 2-digit year (DD/MM/YY or DD-MM-YY) - interpret as 20xx
     numeric_2digit = re.match(r'((0?[1-9]|[12][0-9]|3[01])[/-](0?[1-9]|1[0-2])[/-](\d{2}))$', date_str)
     if numeric_2digit:
-        d, m, y = numeric_2digit.groups()
+        _, d, m, y = numeric_2digit.groups()
         year_2digit = int(y)
         # Interpret 2-digit year as 20xx (2000-2099)
         year = 2000 + year_2digit
@@ -803,7 +803,7 @@ def parse_date_with_year_inference(date_str, current_year, month_map):
     # Pattern 2: Numeric date with 4-digit year (DD/MM/YYYY or DD-MM-YYYY)
     numeric_match = re.match(r'((0?[1-9]|[12][0-9]|3[01])[/-](0?[1-9]|1[0-2])[/-](\d{4}))', date_str)
     if numeric_match:
-        d, m, y = numeric_match.groups()
+        _, d, m, y = numeric_match.groups()
         year = int(y)
         # Reject future years and years before 2000
         # Instead of returning None, use current_year if available
@@ -1005,6 +1005,7 @@ def parse_transactions_visual(pdf_file, debug_info=None, multiline_mode="Auto-de
     description_patterns = [r'\bdescription\b', r'\bparticulars\b', r'\bdetails\b', r'\btransaction\b', r'\bnarrative\b', r'\bmemo\b', r'\btransaction\s+details\b']
     debit_patterns = [r'\bdeb(it)?s?\b', r'\bwithdrawals?\b', r'\bpayments?\b', r'\bdr\b']
     credit_patterns = [r'\bcr(edits?)?\b', r'\bdeposits?\b', r'\breceived\b', r'\bcr\b']
+    amount_patterns = [r'\bamount\b']
     balance_patterns = [r'\bbal(ance)?\b', r'\brunning\s+bal\b', r'\bavail\w*\s+bal\b']
     
     # Transaction section header indicators
@@ -1108,7 +1109,7 @@ def parse_transactions_visual(pdf_file, debug_info=None, multiline_mode="Auto-de
                 potential_headers = []
                 for line_idx, line_words in enumerate(lines_to_scan):
                     test_boundaries, test_headers = detect_visual_column_boundaries_with_debug(
-                        line_words, date_patterns, description_patterns, debit_patterns, credit_patterns, balance_patterns
+                        line_words, date_patterns, description_patterns, debit_patterns, credit_patterns, amount_patterns, balance_patterns
                     )
                     # Need at least 3 headers detected to be confident (Date, Desc, and one amount column)
                     if test_headers and len(test_headers) >= 3:
@@ -1816,46 +1817,50 @@ def parse_transactions_visual(pdf_file, debug_info=None, multiline_mode="Auto-de
                         # Unpack all 5 column boundaries: DATE, DESC, DEBIT, CREDIT, BALANCE
                         date_left, date_right, desc_left, desc_right, debit_left, debit_right, credit_left, credit_right, balance_left, balance_right = column_boundaries
                         
-                        # First check which column this amount's x-position falls into
-                        if debit_left is not None and debit_right is not None:
-                            in_debit_zone = debit_left <= x_center <= debit_right
-                            debug_checks.append(f"DEBIT: {debit_left:.1f} <= {x_center:.1f} <= {debit_right:.1f} = {in_debit_zone}")
-                            if in_debit_zone:
-                                debit = amt['value']
-                                assigned_col = 'DEBIT'
-                        else:
-                            debug_checks.append(f"DEBIT: N/A (no boundaries)")
-                        
-                        if not assigned_col and credit_left is not None and credit_right is not None:
-                            in_credit_zone = credit_left <= x_center <= credit_right
-                            debug_checks.append(f"CREDIT: {credit_left:.1f} <= {x_center:.1f} <= {credit_right:.1f} = {in_credit_zone}")
-                            if in_credit_zone:
-                                credit = amt['value']
-                                assigned_col = 'CREDIT'
-                        else:
-                            debug_checks.append(f"CREDIT: N/A (no boundaries)")
-                        
-                        if not assigned_col and balance_left is not None and balance_right is not None:
+                        # FIRST: Check if amount is in balance zone - this takes priority
+                        # This prevents balance amounts with CR/DR suffixes from being misclassified
+                        if balance_left is not None and balance_right is not None:
                             in_balance_zone = balance_left <= x_center <= balance_right
                             debug_checks.append(f"BALANCE: {balance_left:.1f} <= {x_center:.1f} <= {balance_right:.1f} = {in_balance_zone}")
                             if in_balance_zone:
                                 # Use signed_value to preserve negative sign from DB suffix or minus sign
                                 balance = amt['signed_value']
-                                assigned_col = 'BALANCE'
-                        else:
-                            debug_checks.append(f"BALANCE: N/A (no boundaries)")
+                                assigned_col = 'BALANCE (zone)'
                         
-                        # Check for type hint from suffix (DB/CR) as fallback if x-position didn't assign
+                        # SECOND: For amounts NOT in balance zone, check CR/DR suffixes FIRST
+                        # This is critical for 4-column format where debit and credit boundaries are the same (amount column)
                         if not assigned_col:
                             type_hint = amt.get('type_hint')
                             if type_hint == 'DEBIT':
                                 debit = amt['value']
                                 assigned_col = 'DEBIT (DB suffix)'
-                                debug_checks.append(f"DEBIT: Assigned by DB suffix fallback, value={amt['value']}")
+                                debug_checks.append(f"DEBIT: Assigned by DB suffix, value={amt['value']}")
                             elif type_hint == 'CREDIT':
                                 credit = amt['value']
                                 assigned_col = 'CREDIT (CR suffix)'
-                                debug_checks.append(f"CREDIT: Assigned by CR suffix fallback, value={amt['value']}")
+                                debug_checks.append(f"CREDIT: Assigned by CR suffix, value={amt['value']}")
+                        
+                        # THIRD: Only use x-position zones if no CR/DR suffix and not in balance zone
+                        # This is for 5-column format where debit and credit are separate columns
+                        # Skip zone checks if debit and credit boundaries are the same (4-column format)
+                        if not assigned_col and not (debit_left == credit_left and debit_right == credit_right):
+                            if debit_left is not None and debit_right is not None:
+                                in_debit_zone = debit_left <= x_center <= debit_right
+                                debug_checks.append(f"DEBIT: {debit_left:.1f} <= {x_center:.1f} <= {debit_right:.1f} = {in_debit_zone}")
+                                if in_debit_zone:
+                                    debit = amt['value']
+                                    assigned_col = 'DEBIT (zone)'
+                            else:
+                                debug_checks.append(f"DEBIT: N/A (no boundaries)")
+                            
+                            if not assigned_col and credit_left is not None and credit_right is not None:
+                                in_credit_zone = credit_left <= x_center <= credit_right
+                                debug_checks.append(f"CREDIT: {credit_left:.1f} <= {x_center:.1f} <= {credit_right:.1f} = {in_credit_zone}")
+                                if in_credit_zone:
+                                    credit = amt['value']
+                                    assigned_col = 'CREDIT (zone)'
+                            else:
+                                debug_checks.append(f"CREDIT: N/A (no boundaries)")
                     
                     if not assigned_col:
                         # Fallback: sort by x-position and assign
@@ -2248,6 +2253,7 @@ def parse_transactions_from_ocr(ocr_pages_data, debug_info=None, multiline_mode=
     description_patterns = [r'\bdescription\b', r'\bparticulars\b', r'\bdetails\b', r'\btransaction\b', r'\bnarrative\b', r'\bmemo\b', r'\btransaction\s+details\b']
     debit_patterns = [r'\bdeb(it)?s?\b', r'\bwithdrawals?\b', r'\bpayments?\b', r'\bdr\b']
     credit_patterns = [r'\bcr(edits?)?\b', r'\bdeposits?\b', r'\breceived\b', r'\bcr\b']
+    amount_patterns = [r'\bamount\b']
     balance_patterns = [r'\bbal(ance)?\b', r'\brunning\s+bal\b', r'\bavail\w*\s+bal\b']
     
     header_patterns = [
@@ -2279,7 +2285,7 @@ def parse_transactions_from_ocr(ocr_pages_data, debug_info=None, multiline_mode=
             lines_to_scan = lines[:10] if page_num > 1 else lines
             for line_idx, line_words in enumerate(lines_to_scan):
                 test_boundaries, test_headers = detect_visual_column_boundaries_with_debug(
-                    line_words, date_patterns, description_patterns, debit_patterns, credit_patterns, balance_patterns
+                    line_words, date_patterns, description_patterns, debit_patterns, credit_patterns, amount_patterns, balance_patterns
                 )
                 if test_headers and len(test_headers) >= 3:
                     column_boundaries = equalize_debit_credit_ranges(test_boundaries)
@@ -2457,8 +2463,8 @@ def parse_transactions_from_ocr(ocr_pages_data, debug_info=None, multiline_mode=
                     desc_words.append(w['text'])
             
             description = ' '.join(desc_words)
-            if date_match:
-                description = description[len(date_match.group(0)):].strip()
+            if raw_date_match:
+                description = description[len(raw_date_match.group(0)):].strip()
             description = re.sub(r'^[\s\|\-\.>]+', '', description)
             
             # Assign amounts to columns (same logic as parse_transactions_visual)
@@ -2466,9 +2472,31 @@ def parse_transactions_from_ocr(ocr_pages_data, debug_info=None, multiline_mode=
             credit = 0.0
             balance = 0.0
             
-            # ... (amount assignment logic - abbreviated for brevity)
-            # For now, use simple positional assignment
+            # First, check if any amount is in balance zone (if column boundaries exist)
+            if column_boundaries and amounts:
+                _, _, desc_left, desc_right, debit_left, debit_right, credit_left, credit_right, balance_left, balance_right = column_boundaries
+                for amt in amounts:
+                    x_center = amt['x_center']
+                    # Check if in balance zone first
+                    if balance_left is not None and balance_right is not None:
+                        in_balance_zone = balance_left <= x_center <= balance_right
+                        if in_balance_zone:
+                            balance = amt['signed_value']
+                            # Remove this amount from further processing
+                            amounts = [a for a in amounts if a != amt]
+                            break
+            
+            # Then check for type hint from suffix (DB/CR) for remaining amounts
             if amounts:
+                for amt in amounts:
+                    type_hint = amt.get('type_hint')
+                    if type_hint == 'DEBIT':
+                        debit = amt['value']
+                    elif type_hint == 'CREDIT':
+                        credit = amt['value']
+            
+            # If no type hints assigned, use positional assignment as fallback
+            if debit == 0.0 and credit == 0.0 and amounts:
                 sorted_amts = sorted(amounts, key=lambda x: x['x_center'])
                 if len(sorted_amts) == 1:
                     balance = sorted_amts[0]['signed_value']
@@ -2531,15 +2559,18 @@ def group_words_by_line(words, y_tolerance=3):
 
 def extract_amounts_with_positions(line_words):
     """Extract monetary amounts from line words with their x-positions.
-    Handles formats like: 7.09, $7.09, 7.09DB, 2.30CR, -100.50
-    Excludes numbers starting with 0 or 00 (likely IDs/reference numbers)
+    Handles formats like: 7.09, $7.09, 7.09DB, 2.30CR, -100.50, 0.99, 0.01
+    Also handles CR/DR as separate words after the amount (e.g., "100.00" followed by "CR")
+    Excludes numbers starting with 00 (likely IDs/reference numbers) but allows 0.xx for values < 1
     """
     amounts = []
     # Pattern matches: optional currency, optional minus, number, optional DB/CR suffix
-    # Exclude numbers starting with 0 or 00 to preserve them as text in descriptions
-    amount_pattern = r'^[\$€£¥]?\s*(-?)([1-9][\d,]*\.\d{2})(?:\s*(DB|CR|DR|CRD))?\s*$'
+    # Allow values < 1 (0.99, 0.01) but exclude pure IDs like 00123
+    amount_pattern = r'^[\$€£¥]?\s*(-?)(0?\d[\d,]*\.\d{2})(?:\s*(DB|CR|DR|CRD))?\s*$'
+    # Pattern for standalone CR/DR suffix words
+    suffix_pattern = r'^(DB|CR|DR|CRD)\s*$'
     
-    for word in line_words:
+    for i, word in enumerate(line_words):
         text = word['text'].strip()
         match = re.match(amount_pattern, text, re.IGNORECASE)
         if match:
@@ -2547,6 +2578,14 @@ def extract_amounts_with_positions(line_words):
                 has_minus = match.group(1) == '-'
                 val = float(match.group(2).replace(',', ''))
                 type_hint = match.group(3).upper() if match.group(3) else None
+                
+                # Check if the next word is a CR/DR suffix (separate word case)
+                if not type_hint and i + 1 < len(line_words):
+                    next_word = line_words[i + 1]
+                    next_text = next_word['text'].strip()
+                    suffix_match = re.match(suffix_pattern, next_text, re.IGNORECASE)
+                    if suffix_match:
+                        type_hint = suffix_match.group(1).upper()
                 
                 # Normalize type hints: DB/DR -> debit, CR/CRD -> credit
                 normalized_hint = None
@@ -2575,17 +2614,21 @@ def extract_amounts_with_positions(line_words):
     return amounts
 
 
-def detect_visual_column_boundaries_with_debug(header_words, date_patterns, description_patterns, debit_patterns, credit_patterns, balance_patterns):
+def detect_visual_column_boundaries_with_debug(header_words, date_patterns, description_patterns, debit_patterns, credit_patterns, amount_patterns, balance_patterns):
     """
-    Detect ALL 5 column header positions using visual x-coordinates and calculate boundaries.
+    Detect ALL column header positions using visual x-coordinates and calculate boundaries.
+    Supports both 5-column format (Date, Description, Debit, Credit, Balance) and
+    4-column format (Date, Description, Amount, Balance) where Amount has CR/DR suffixes.
     Returns both boundaries (10 values for 5 columns) and debug info about headers found.
-    
+
     Boundaries format: (date_l, date_r, desc_l, desc_r, debit_l, debit_r, credit_l, credit_r, balance_l, balance_r)
+    For 4-column format: debit and credit boundaries will be the same as amount boundaries.
     """
     date_pos = None
     desc_pos = None
     debit_pos = None
     credit_pos = None
+    amount_pos = None
     balance_pos = None
     header_info = []
     
@@ -2622,6 +2665,13 @@ def detect_visual_column_boundaries_with_debug(header_words, date_patterns, desc
                 header_info.append({'type': 'CREDIT', 'text': word['text'], 'x_center': round(x_center, 1), 'x0': round(x0, 1), 'x1': round(x1, 1)})
                 break
         
+        # Check for amount header (for 4-column format with CR/DR suffixes)
+        for pattern in amount_patterns:
+            if re.search(pattern, text_lower):
+                amount_pos = x_center
+                header_info.append({'type': 'AMOUNT', 'text': word['text'], 'x_center': round(x_center, 1), 'x0': round(x0, 1), 'x1': round(x1, 1)})
+                break
+        
         # Check for balance header
         for pattern in balance_patterns:
             if re.search(pattern, text_lower):
@@ -2640,6 +2690,7 @@ def detect_visual_column_boundaries_with_debug(header_words, date_patterns, desc
     if desc_pos: positions.append(('DESC', desc_pos))
     if debit_pos: positions.append(('DEBIT', debit_pos))
     if credit_pos: positions.append(('CREDIT', credit_pos))
+    if amount_pos: positions.append(('AMOUNT', amount_pos))
     if balance_pos: positions.append(('BALANCE', balance_pos))
     
     if len(positions) >= 2:
@@ -2674,7 +2725,14 @@ def detect_visual_column_boundaries_with_debug(header_words, date_patterns, desc
         desc_bounds = all_bounds.get('DESC')
         debit_bounds = all_bounds.get('DEBIT')
         credit_bounds = all_bounds.get('CREDIT')
+        amount_bounds = all_bounds.get('AMOUNT')
         balance_bounds = all_bounds.get('BALANCE')
+        
+        # If AMOUNT column is detected (4-column format), use it for both debit and credit
+        # The CR/DR suffix in the amount will determine debit vs credit
+        if amount_bounds and not debit_bounds and not credit_bounds:
+            debit_bounds = amount_bounds
+            credit_bounds = amount_bounds
         
         # Estimate any missing columns with gaps between zones
         # This ensures no overlap: each zone ends where the next begins
@@ -2685,18 +2743,18 @@ def detect_visual_column_boundaries_with_debug(header_words, date_patterns, desc
             date_bounds = (0, desc_bounds[0] if desc_bounds else first_pos * 0.5)
         if desc_bounds is None:
             desc_start = date_bounds[1] if date_bounds else 0
-            desc_end = debit_bounds[0] if debit_bounds else first_pos * 0.8
+            desc_end = debit_bounds[0] if debit_bounds else amount_bounds[0] if amount_bounds else first_pos * 0.8
             desc_bounds = (desc_start, desc_end)
         if debit_bounds is None:
             debit_start = desc_bounds[1] if desc_bounds else date_bounds[1] if date_bounds else 0
-            debit_end = credit_bounds[0] if credit_bounds else (credit_pos - 0.1) if credit_pos else balance_bounds[0] * 0.7 if balance_bounds else last_pos * 0.6
+            debit_end = credit_bounds[0] if credit_bounds else amount_bounds[0] if amount_bounds else (credit_pos - 0.1) if credit_pos else balance_bounds[0] * 0.7 if balance_bounds else last_pos * 0.6
             debit_bounds = (debit_start, debit_end)
         if credit_bounds is None:
-            credit_start = debit_bounds[1] if debit_bounds else debit_pos if debit_pos else desc_bounds[1] if desc_bounds else first_pos
+            credit_start = debit_bounds[1] if debit_bounds else debit_pos if debit_pos else amount_bounds[0] if amount_bounds else desc_bounds[1] if desc_bounds else first_pos
             credit_end = balance_bounds[0] if balance_bounds else (balance_pos - 0.1) if balance_pos else last_pos * 0.8
             credit_bounds = (credit_start, credit_end)
         if balance_bounds is None:
-            balance_start = credit_bounds[1] if credit_bounds else credit_pos if credit_pos else debit_bounds[1] if debit_bounds else last_pos
+            balance_start = credit_bounds[1] if credit_bounds else credit_pos if credit_pos else amount_bounds[1] if amount_bounds else debit_bounds[1] if debit_bounds else last_pos
             balance_bounds = (balance_start, 10000)
         
         boundaries = (date_bounds[0], date_bounds[1], 
@@ -2724,13 +2782,15 @@ def detect_visual_column_boundaries_with_debug(header_words, date_patterns, desc
     return boundaries, header_info
 
 
-def detect_visual_column_boundaries(header_words, date_patterns, description_patterns, debit_patterns, credit_patterns, balance_patterns):
+def detect_visual_column_boundaries(header_words, date_patterns, description_patterns, debit_patterns, credit_patterns, amount_patterns, balance_patterns):
     """
-    Detect ALL 5 column header positions using visual x-coordinates and calculate boundaries.
+    Detect ALL column header positions using visual x-coordinates and calculate boundaries.
+    Supports both 5-column format (Date, Description, Debit, Credit, Balance) and
+    4-column format (Date, Description, Amount, Balance) where Amount has CR/DR suffixes.
     Boundaries are at midpoints between adjacent column centers.
     """
     boundaries, _ = detect_visual_column_boundaries_with_debug(
-        header_words, date_patterns, description_patterns, debit_patterns, credit_patterns, balance_patterns
+        header_words, date_patterns, description_patterns, debit_patterns, credit_patterns, amount_patterns, balance_patterns
     )
     return boundaries
 
